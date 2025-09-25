@@ -464,10 +464,6 @@ public:
     }
 
 
-
-
-
-
     template< class point_t >
     inline static
     Mat3 tensor( const point_t & p1 , const point_t & p2 )

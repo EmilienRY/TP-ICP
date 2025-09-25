@@ -44,7 +44,6 @@ Vec3 ICPtranslation; // USED TO ALIGN pointset 2 onto pointset 1
 std::vector< Vec3 > positions3;
 std::vector< Vec3 > normals3; // OUTPUT of alignment
 
-
 // -------------------------------------------
 // OpenGL/GLUT application code.
 // -------------------------------------------
@@ -59,7 +58,74 @@ static bool mouseZoomPressed = false;
 static int lastX=0, lastY=0, lastZoom=0;
 static bool fullScreen = false;
 
-int nbIter=1;
+int nbIter=10;
+
+
+void projectPointOnPlane( Vec3 const & point , Vec3 const & planePoint , Vec3 const & planeNormal , Vec3 & projectedPoint ) {
+    Vec3 v = point - planePoint;
+    float dist = Vec3::dot( v , planeNormal );
+    projectedPoint = point - dist * planeNormal;
+}   
+
+void HPSS(Vec3 inputPoint,Vec3 & outputPoint,Vec3 & outputNormal,std::vector< Vec3 > const & positions,std::vector< Vec3 > const & normals,BasicANNkdTree const & kdtree, int kernel_type,float radius,unsigned int nbIterations=10,unsigned int knn=20) {
+
+    ANNidxArray id_nearest_neighbors = new ANNidx[ knn ];
+    ANNdistArray square_distances_to_neighbors = new ANNdist[ knn ]; 
+
+    Vec3 currentPt = inputPoint;
+    Vec3 currentNormal(0.0f,0.0f,0.0f);
+
+    const float sigma2 = radius * radius;
+
+    for(unsigned int it = 0; it < nbIterations; ++it) {
+
+        kdtree.knearest( currentPt , static_cast<int>(knn) , id_nearest_neighbors , square_distances_to_neighbors );
+
+        float totalWeight = 0.0f;
+        Vec3 centroid(0.0f, 0.0f, 0.0f);
+        Vec3 avgNormal(0.0f, 0.0f, 0.0f);
+
+        for (unsigned int i = 0; i < knn; ++i) {
+            ANNidx idx = id_nearest_neighbors[i];
+
+            Vec3 diff = positions[idx] - currentPt;
+            float d2 = Vec3::dot(diff, diff);
+            float d = sqrtf(d2); 
+            float gaussWeight = std::exp( - (d * d) / sigma2 );
+
+            Vec3 ni = normals[idx];
+            ni.normalize();
+
+            Vec3 proj;
+            projectPointOnPlane(currentPt, positions[idx], ni, proj);
+
+            centroid = centroid + gaussWeight * proj;
+            avgNormal = avgNormal + gaussWeight * ni;
+            totalWeight += gaussWeight;
+        }
+
+        centroid = centroid / totalWeight;
+        avgNormal = avgNormal / totalWeight;
+        avgNormal.normalize();
+
+        Vec3 projected;
+        projectPointOnPlane(currentPt, centroid, avgNormal, projected);
+
+        currentPt = projected;
+        currentNormal = avgNormal;
+    }
+
+    outputPoint = currentPt;
+    outputNormal = currentNormal;
+
+    delete [] id_nearest_neighbors;
+    delete [] square_distances_to_neighbors;
+}
+
+
+
+
+
 
 
 
@@ -67,68 +133,129 @@ int nbIter=1;
 // ICP
 // ------------------------------------
 
+
 void ICP(std::vector<Vec3> const & ps , std::vector<Vec3> const & nps ,
          std::vector<Vec3> const & qs , std::vector<Vec3> const & nqs ,
          BasicANNkdTree const & qsKdTree , Mat3 & rotation , Vec3 & translation , unsigned int nIterations) {
     // align ps on qs : qs = rotation * ps + translation
 
-    Vec3 centroid_source(0,0,0), centroid_target(0,0,0);
-    for(unsigned int i = 0; i < ps.size(); ++i) {
-        centroid_source += ps[i];
-    }
-    centroid_source /= (float)ps.size();
-    
-    for(unsigned int i = 0; i < qs.size(); ++i) {
-        centroid_target += qs[i];
-    }
-    centroid_target /= (float)qs.size();
-    
-    translation = centroid_target - centroid_source;
+    std::vector<Vec3> currentPoints = ps;
 
-    for(unsigned int it = 0; it < nIterations; ++it) {
+    for(unsigned int it = 0; it < nIterations; it++) {
         std::cout << "  Itération " << (it+1) << "/" << nIterations << std::endl;
         
-        std::vector<Vec3> transformed_ps, matched_qs;
+        std::vector<Vec3> correspondingTargets;
+        correspondingTargets.reserve(currentPoints.size());
         
-        for(unsigned int pIt = 0; pIt < ps.size(); ++pIt) {
-            Vec3 transformed_p = rotation * ps[pIt] + translation;
-            unsigned int nearestIdx = qsKdTree.nearest(transformed_p); 
-            transformed_ps.push_back(transformed_p);
-            matched_qs.push_back(qs[nearestIdx]);
+        for(unsigned int pIt = 0; pIt < currentPoints.size(); pIt++) {
+            unsigned int nearestIdx = qsKdTree.nearest(currentPoints[pIt]);
+            correspondingTargets.push_back(qs[nearestIdx]);
         }
 
-        Vec3 centroid_p(0,0,0), centroid_q(0,0,0);
-        for(unsigned int i = 0; i < transformed_ps.size(); ++i) {
-            centroid_p += transformed_ps[i];
-            centroid_q += matched_qs[i];
+        Vec3 srcCentroid(0,0,0), tgtCentroid(0,0,0);
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            srcCentroid += currentPoints[i];
+            tgtCentroid += correspondingTargets[i];
         }
-        centroid_p /= (float)transformed_ps.size();
-        centroid_q /= (float)matched_qs.size();
+        srcCentroid /= (float)currentPoints.size();
+        tgtCentroid /= (float)correspondingTargets.size(); 
 
         Mat3 M = Mat3::Zero();
-        for(unsigned int i = 0; i < transformed_ps.size(); ++i) {
-            Vec3 p_centered = transformed_ps[i] - centroid_p;
-            Vec3 q_centered = matched_qs[i] - centroid_q;
-            M += Mat3::tensor(p_centered, q_centered);
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            Vec3 srcCentered = currentPoints[i] - srcCentroid;
+            Vec3 tgtCentered = correspondingTargets[i] - tgtCentroid;
+            M += Mat3::tensor(srcCentered, tgtCentered); 
         }
 
         Mat3 U, Vt;
         float sx, sy, sz;
         M.SVD(U, sx, sy, sz, Vt);
 
-        Mat3 R = Vt.getTranspose() * U.getTranspose();
-        // if(R.determinant() < 0) { 
-        //     Mat3 corr = Mat3::Identity();
-        //     corr(2,2) = -1;
-        //     R = Vt.getTranspose() * corr * U.getTranspose();
-        // }
-   
-        Vec3 t_inc = centroid_q - R * centroid_p;
+        Mat3 V = Vt.getTranspose();
+        Mat3 R = V * U.getTranspose();
 
-        translation = R * translation + t_inc;
+        if (R.determinant() < 0) {
+            Mat3 D = Mat3::Identity();
+            D(2,2) = -1.0f; 
+            R = V * D * U.getTranspose();
+        }
+   
+        Vec3 t = tgtCentroid - R * srcCentroid;
+
         rotation = R * rotation;
+        translation = R * translation + t;
+        
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            currentPoints[i] = R * currentPoints[i] + t;
+        }
     }
 }
+
+
+void ICP_HPSS(std::vector<Vec3> const & ps , std::vector<Vec3> const & nps ,
+         std::vector<Vec3> const & qs , std::vector<Vec3> const & nqs ,
+         BasicANNkdTree const & qsKdTree , Mat3 & rotation , Vec3 & translation , unsigned int nIterations) {
+    // align ps on qs : qs = rotation * ps + translation
+
+    std::vector<Vec3> currentPoints = ps;
+
+    for(unsigned int it = 0; it < nIterations; it++) {
+        std::cout << "  Itération " << (it+1) << "/" << nIterations << std::endl;
+        
+        std::vector<Vec3> correspondingTargets;
+        correspondingTargets.reserve(currentPoints.size());
+        
+        for(unsigned int pIt = 0; pIt < currentPoints.size(); pIt++) {
+            Vec3 projectedPoint, projectedNormal;
+        
+            HPSS(currentPoints[pIt], projectedPoint, projectedNormal, 
+                 qs, nqs, qsKdTree, 0, 0.5, 5, 10);
+            
+            correspondingTargets.push_back(projectedPoint);
+        }
+
+        Vec3 srcCentroid(0,0,0), tgtCentroid(0,0,0);
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            srcCentroid += currentPoints[i];
+            tgtCentroid += correspondingTargets[i];
+        }
+        srcCentroid /= (float)currentPoints.size();
+        tgtCentroid /= (float)correspondingTargets.size(); 
+
+        Mat3 M = Mat3::Zero();
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            Vec3 srcCentered = currentPoints[i] - srcCentroid;
+            Vec3 tgtCentered = correspondingTargets[i] - tgtCentroid;
+            M += Mat3::tensor(srcCentered, tgtCentered); 
+        }
+
+        Mat3 U, Vt;
+        float sx, sy, sz;
+        M.SVD(U, sx, sy, sz, Vt);
+
+        Mat3 V = Vt.getTranspose();
+        Mat3 R = V * U.getTranspose();
+
+        if (R.determinant() < 0) {
+            Mat3 D = Mat3::Identity();
+            D(2,2) = -1.0f; 
+            R = V * D * U.getTranspose();
+        }
+   
+        Vec3 t = tgtCentroid - R * srcCentroid;
+
+        rotation = R * rotation;
+        translation = R * translation + t;
+        
+        for(unsigned int i = 0; i < currentPoints.size(); i++) {
+            currentPoints[i] = R * currentPoints[i] + t;
+        }
+    }
+}
+
+
+
+
 
 // ------------------------------------
 // i/o and some stuff
@@ -367,11 +494,26 @@ void performICP( unsigned int nIterations ) {
     positions3.resize(positions2.size());
     normals3.resize(normals2.size());
     
-    // Initialisation simple - l'ACP se chargera de la vraie initialisation
     ICProtation = Mat3::Identity();
     ICPtranslation = Vec3(0, 0, 0);
         
     ICP(positions2 , normals2 , positions , normals , kdtree , ICProtation , ICPtranslation , nIterations );
+
+    for( unsigned int pIt = 0 ; pIt < positions2.size() ; ++pIt ) {
+        positions3[pIt] = ICProtation * positions2[pIt] + ICPtranslation;
+        normals3[pIt] = ICProtation * normals2[pIt];
+    }
+}
+
+void performICP_HPSS( unsigned int nIterations ) {
+    positions3.resize(positions2.size());
+    normals3.resize(normals2.size());
+    
+    ICProtation = Mat3::Identity();
+    ICPtranslation = Vec3(0, 0, 0);
+    
+    std::cout << "=== ICP avec projection HPSS ===" << std::endl;
+    ICP_HPSS(positions2 , normals2 , positions , normals , kdtree , ICProtation , ICPtranslation , nIterations );
 
     for( unsigned int pIt = 0 ; pIt < positions2.size() ; ++pIt ) {
         positions3[pIt] = ICProtation * positions2[pIt] + ICPtranslation;
@@ -413,9 +555,16 @@ void key (unsigned char keyPressed, int x, int y) {
         break;
 
     case 'i':
-        std::cout << "ICP démarré..." << std::endl;
+        std::cout << "ICP standard démarré..." << std::endl;
         performICP(nbIter);
-        std::cout << "ICP terminé!" << std::endl;
+        std::cout << "ICP standard terminé!" << std::endl;
+        glutPostRedisplay(); 
+        break;
+
+    case 'h': 
+        std::cout << "ICP+HPSS démarré..." << std::endl;
+        performICP_HPSS(nbIter);
+        std::cout << "ICP+HPSS terminé!" << std::endl;
         glutPostRedisplay(); 
         break;
 
@@ -507,27 +656,30 @@ int main (int argc, char ** argv) {
     // ICP :
     {
         // Load a first pointset, and build a kd-tree:
-        loadPN("pointsets/face.pn" , positions , normals);
+        loadPN("pointsets/dino.pn" , positions , normals);
         kdtree.build(positions);
 
         // Load a second pointset :
-        loadPN("pointsets/face.pn" , positions2 , normals2);
+        loadPN("pointsets/dino_partial_1.pn" , positions2 , normals2);
 
         // Transform it slightly :
         srand(time(NULL));
-        Mat3 rotation = Mat3::RandRotation(M_PI / 3); // PLAY WITH THIS PARAMETER !!!!!!
+        Mat3 rotation = Mat3::RandRotation(); // PLAY WITH THIS PARAMETER !!!!!!
         Vec3 translation = Vec3( -1.0 + 2.0 * ((double)(rand()) / (double)(RAND_MAX)),-1.0 + 2.0 * ((double)(rand()) / (double)(RAND_MAX)),-1.0 + 2.0 * ((double)(rand()) / (double)(RAND_MAX)) );
         for( unsigned int pIt = 0 ; pIt < positions2.size() ; ++pIt ) {
             positions2[pIt] = rotation * positions2[pIt] + translation;
             normals2[pIt] = rotation * normals2[pIt];
         }
 
-        // Initialiser les variables ICP
+        // Initial solution for ICP :
         ICProtation = Mat3::Identity();
-        ICPtranslation = Vec3(0, 0, 0);
+        ICPtranslation = Vec3(0,0,0);
+        positions3 = positions2;
+        normals3 = normals2;
     }
 
     glutMainLoop ();
     return EXIT_SUCCESS;
 }
+
 
